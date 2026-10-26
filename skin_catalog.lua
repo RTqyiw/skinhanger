@@ -252,9 +252,16 @@ end
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
+-- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 local wearItem
 local equippedRevision = 0
 local hiddenOriginals, activeSlots, slotOrders = {}, {}, {}
+local accessoryAssetSlots = {
+    [8] = "Hat", [41] = "Hair", [42] = "Face", [43] = "Neck",
+    [44] = "Shoulder", [45] = "Front", [46] = "Back", [47] = "Waist",
+    [64] = "TShirt", [65] = "Shirt", [66] = "Pants", [67] = "Jacket",
+    [68] = "Sweater", [69] = "Shorts", [70] = "LeftShoe", [71] = "RightShoe", [72] = "DressSkirt",
+}
 local originalAppearance = {detached = {}, properties = {}}
 local function remember(object, property, value)
     local saved = originalAppearance.properties[object]
@@ -269,9 +276,10 @@ local function accessorySlot(item)
     if item:IsA("Pants") then return "ClassicPants" end
     if item:IsA("ShirtGraphic") then return "ClassicTShirt" end
     if item:IsA("Decal") then return "Face" end
+    local handle = item:FindFirstChild("Handle")
+    if handle and handle:FindFirstChild("HairAttachment") then return "Accessory:Hair" end
     local ok, kind = pcall(function() return item.AccessoryType.Name end)
     if ok and kind and kind ~= "Unknown" then return "Accessory:" .. kind end
-    local handle = item:FindFirstChild("Handle")
     local attachments = {
         HatAttachment = "Hat", HairAttachment = "Hair",
         FaceFrontAttachment = "Face", FaceCenterAttachment = "Face",
@@ -288,9 +296,11 @@ local function accessorySlot(item)
     return "Accessory:Hat"
 end
 local function hideOriginal(item, slot)
-    if hiddenOriginals[item] then return end
-    local saved = {slot = slot, properties = {}}
-    hiddenOriginals[item] = saved
+    local saved = hiddenOriginals[item]
+    if not saved then
+        saved = {slot = slot, parent = item.Parent, properties = {}}
+        hiddenOriginals[item] = saved
+    end
     for _, part in ipairs(item:GetDescendants()) do
         local properties
         if part:IsA("BasePart") then
@@ -303,8 +313,10 @@ local function hideOriginal(item, slot)
             properties = {Enabled = part.Enabled}
             part.Enabled = false
         end
-        if properties then saved.properties[part] = properties end
+        if properties and not saved.properties[part] then saved.properties[part] = properties end
     end
+    -- Исходный Instance остаётся в памяти для сброса, но больше не рендерится в персонаже.
+    item.Parent = nil
 end
 local function hideSlotOriginals(character, slot)
     for _, child in ipairs(character:GetChildren()) do
@@ -316,6 +328,8 @@ local function hideSlotOriginals(character, slot)
 end
 local function clearEquipped()
     equippedRevision = equippedRevision + 1
+    table.clear(activeSlots)
+    table.clear(slotOrders)
     for _, item in ipairs(equippedItems) do
         if item.Parent then item:Destroy() end
     end
@@ -328,18 +342,18 @@ local function clearEquipped()
     end
     table.clear(originalAppearance.properties)
     table.clear(originalAppearance.detached)
-    for _, saved in pairs(hiddenOriginals) do
+    for original, saved in pairs(hiddenOriginals) do
         for part, properties in pairs(saved.properties) do
             for name, value in pairs(properties) do pcall(function() part[name] = value end) end
         end
+        if saved.parent and saved.parent.Parent then pcall(function() original.Parent = saved.parent end) end
     end
     table.clear(hiddenOriginals)
-    table.clear(activeSlots)
-    table.clear(slotOrders)
 end
 do
     local pending = {}
     local requestOrder = 0
+    local scheduleReconcile
     local function destroyRoots(roots)
         for _, root in ipairs(roots) do
             if typeof(root) == "Instance" then root:Destroy() end
@@ -580,6 +594,9 @@ do
                     item = prepareHead(character, payload)
                     payload:Destroy()
                 end
+                if (item:IsA("Accessory") or item:IsA("Hat")) and accessoryAssetSlots[assetType] then
+                    item:SetAttribute("SkinSlot", "Accessory:" .. accessoryAssetSlots[assetType])
+                end
                 local slot = accessorySlot(item)
                 if token.order < (slotOrders[slot] or 0) then
                     item:Destroy(); item = nil
@@ -599,6 +616,7 @@ do
                 end
                 activeSlots[slot], slotOrders[slot] = item, token.order
                 table.insert(equippedItems, item)
+                if scheduleReconcile then scheduleReconcile() end
             end)
             if pending[id] == token then pending[id] = nil end
             if not ok then
@@ -613,12 +631,75 @@ do
             end
         end)
     end
-    connect(player.CharacterAppearanceLoaded, function(character)
+    local watchConnections, watchedItems = {}, {}
+    local watchedCharacter, queued = nil, false
+    local function stopWatching()
+        for _, connection in ipairs(watchConnections) do connection:Disconnect() end
+        table.clear(watchConnections)
+        table.clear(watchedItems)
+        watchedCharacter, queued = nil, false
+    end
+    local function reconcile(character)
         if not alive or character ~= player.Character then return end
         for slot, item in pairs(activeSlots) do
-            if item.Parent == character then hideSlotOriginals(character, slot) end
+            if item:IsDescendantOf(character) then
+                if slot:sub(1, 10) == "Accessory:" then
+                    hideSlotOriginals(character, slot)
+                elseif slot == "ClassicShirt" or slot == "ClassicPants" or slot == "ClassicTShirt" then
+                    for _, original in ipairs(character:GetChildren()) do
+                        if original.ClassName == item.ClassName and original ~= item and not original:GetAttribute("SkinAssetId") then
+                            if not originalAppearance.detached[original] then originalAppearance.detached[original] = character end
+                            original.Parent = nil
+                        end
+                    end
+                elseif slot == "Face" then
+                    local head = character:FindFirstChild("Head")
+                    if head then hideHeadDecals(head) end
+                elseif slot == "Head" then
+                    local head = character:FindFirstChild("Head")
+                    if head then
+                        remember(head, "Transparency", 1)
+                        remember(head, "LocalTransparencyModifier", 1)
+                        hideHeadDecals(head)
+                    end
+                end
+            end
         end
+    end
+    scheduleReconcile = function()
+        if queued or not alive or not watchedCharacter then return end
+        queued = true
+        local character, revision = watchedCharacter, equippedRevision
+        task.defer(function()
+            if watchedCharacter ~= character then return end
+            queued = false
+            if equippedRevision == revision then reconcile(character) end
+        end)
+    end
+    local function watchItem(item)
+        if watchedItems[item] or not (item:IsA("Accessory") or item:IsA("Hat")) then return end
+        watchedItems[item] = true
+        local ok, signal = pcall(function() return item:GetPropertyChangedSignal("AccessoryType") end)
+        if ok then table.insert(watchConnections, signal:Connect(scheduleReconcile)) end
+    end
+    local function watchCharacter(character)
+        stopWatching()
+        watchedCharacter = character
+        for _, child in ipairs(character:GetChildren()) do watchItem(child) end
+        table.insert(watchConnections, character.ChildAdded:Connect(function(child)
+            watchItem(child)
+            scheduleReconcile()
+        end))
+        table.insert(watchConnections, character.DescendantAdded:Connect(scheduleReconcile))
+        scheduleReconcile()
+    end
+    connect(player.CharacterAdded, watchCharacter)
+    connect(player.CharacterAppearanceLoaded, function(character)
+        if character == watchedCharacter then scheduleReconcile() end
     end)
+    connect(shutdown.Event, stopWatching)
+    connect(gui.Destroying, stopWatching)
+    if player.Character then watchCharacter(player.Character) end
 end
 
 
