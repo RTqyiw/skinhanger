@@ -164,7 +164,7 @@ local top = create("Frame", window, {BackgroundTransparency = 1, Size = UDim2.ne
 local logo = panel(top, UDim2.fromOffset(22, 20), UDim2.fromOffset(32, 32), "raised", 10)
 icon(logo, "skins", 5, 5, "accent")
 label(top, "SKIN", 65, 17, 100, 24, 18, "text", true)
-label(top, "ATELIER / 02", 66, 41, 130, 15, 9, "muted", true)
+label(top, "ATELIER / 04", 66, 41, 130, 15, 9, "muted", true)
 local rigText = label(top, "CLIENT COSMETICS", 220, 28, 250, 18, 10, "muted", true)
 local hide = button(top, "", UDim2.new(1, -88, 0, 23), UDim2.fromOffset(30, 30), function() setVisible(false) end)
 icon(hide, "minus", 4, 4)
@@ -253,9 +253,18 @@ end
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 -- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
+-- Lua, wear_item.lua, Roblox client; replace the original wearItem function.
 local wearItem
 local equippedRevision = 0
 local hiddenOriginals, activeSlots, slotOrders = {}, {}, {}
+local avatarAssetSlots, avatarNameSlots = {}, {}
+local function normalizedName(name)
+    return tostring(name):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+local function hairName(name)
+    local value = normalizedName(name)
+    return value:find("hair", 1, true) ~= nil or value:find("волос", 1, true) ~= nil
+end
 local accessoryAssetSlots = {
     [8] = "Hat", [41] = "Hair", [42] = "Face", [43] = "Neck",
     [44] = "Shoulder", [45] = "Front", [46] = "Back", [47] = "Waist",
@@ -276,9 +285,14 @@ local function accessorySlot(item)
     if item:IsA("Pants") then return "ClassicPants" end
     if item:IsA("ShirtGraphic") then return "ClassicTShirt" end
     if item:IsA("Decal") then return "Face" end
+    local sourceOk, sourceId = pcall(function() return item.SourceAssetId end)
+    if sourceOk and avatarAssetSlots[tonumber(sourceId)] then return avatarAssetSlots[tonumber(sourceId)] end
+    local knownName = avatarNameSlots[normalizedName(item.Name)]
+    if knownName then return knownName end
     local handle = item:FindFirstChild("Handle")
     if handle and handle:FindFirstChild("HairAttachment") then return "Accessory:Hair" end
     local ok, kind = pcall(function() return item.AccessoryType.Name end)
+    if (not ok or kind == "Unknown" or kind == "Hat") and hairName(item.Name) then return "Accessory:Hair" end
     if ok and kind and kind ~= "Unknown" then return "Accessory:" .. kind end
     local attachments = {
         HatAttachment = "Hat", HairAttachment = "Hair",
@@ -595,7 +609,11 @@ do
                     payload:Destroy()
                 end
                 if (item:IsA("Accessory") or item:IsA("Hat")) and accessoryAssetSlots[assetType] then
-                    item:SetAttribute("SkinSlot", "Accessory:" .. accessoryAssetSlots[assetType])
+                    local chosenSlot = "Accessory:" .. accessoryAssetSlots[assetType]
+                    if assetType == 8 and (accessorySlot(item) == "Accessory:Hair" or hairName(itemName or "")) then
+                        chosenSlot = "Accessory:Hair"
+                    end
+                    item:SetAttribute("SkinSlot", chosenSlot)
                 end
                 local slot = accessorySlot(item)
                 if token.order < (slotOrders[slot] or 0) then
@@ -616,6 +634,12 @@ do
                 end
                 activeSlots[slot], slotOrders[slot] = item, token.order
                 table.insert(equippedItems, item)
+                print("[Skin/Slots] build=4 asset=" .. id .. " slot=" .. slot)
+                for _, original in ipairs(character:GetChildren()) do
+                    if (original:IsA("Accessory") or original:IsA("Hat")) and not original:GetAttribute("SkinAssetId") then
+                        print("[Skin/Slots] remaining=" .. original.Name .. " slot=" .. accessorySlot(original))
+                    end
+                end
                 if scheduleReconcile then scheduleReconcile() end
             end)
             if pending[id] == token then pending[id] = nil end
@@ -633,11 +657,15 @@ do
     end
     local watchConnections, watchedItems = {}, {}
     local watchedCharacter, queued = nil, false
+    local indexing = false
     local function stopWatching()
         for _, connection in ipairs(watchConnections) do connection:Disconnect() end
         table.clear(watchConnections)
         table.clear(watchedItems)
         watchedCharacter, queued = nil, false
+        indexing = false
+        table.clear(avatarAssetSlots)
+        table.clear(avatarNameSlots)
     end
     local function reconcile(character)
         if not alive or character ~= player.Character then return end
@@ -682,6 +710,45 @@ do
         local ok, signal = pcall(function() return item:GetPropertyChangedSignal("AccessoryType") end)
         if ok then table.insert(watchConnections, signal:Connect(scheduleReconcile)) end
     end
+    local function indexAvatar(character)
+        if indexing then return end
+        indexing = true
+        task.spawn(function()
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if not humanoid then indexing = false; return end
+            local ok, description = pcall(function() return humanoid:GetAppliedDescription() end)
+            if not ok or not description then indexing = false; return end
+            local entries = {}
+            local accessoriesOk, accessories = pcall(function() return description:GetAccessories(true) end)
+            if accessoriesOk and type(accessories) == "table" then
+                for _, entry in ipairs(accessories) do
+                    local id = tonumber(entry.AssetId)
+                    if id and entry.AccessoryType then entries[id] = "Accessory:" .. entry.AccessoryType.Name end
+                end
+            end
+            for property, kind in pairs({HairAccessory = "Hair", HatAccessory = "Hat", FaceAccessory = "Face", NeckAccessory = "Neck", ShouldersAccessory = "Shoulder", FrontAccessory = "Front", BackAccessory = "Back", WaistAccessory = "Waist"}) do
+                local readOk, ids = pcall(function() return description[property] end)
+                if readOk then
+                    for value in tostring(ids):gmatch("%d+") do entries[tonumber(value)] = "Accessory:" .. kind end
+                end
+            end
+            description:Destroy()
+            if not alive or watchedCharacter ~= character then return end
+            for id, slot in pairs(entries) do avatarAssetSlots[id] = slot end
+            scheduleReconcile()
+            for id, slot in pairs(entries) do
+                if not alive or watchedCharacter ~= character then return end
+                local infoOk, info = pcall(function() return game:GetService("MarketplaceService"):GetProductInfo(id) end)
+                if not alive or watchedCharacter ~= character then return end
+                if infoOk and type(info) == "table" and type(info.Name) == "string" then
+                    avatarNameSlots[normalizedName(info.Name)] = slot
+                    scheduleReconcile()
+                end
+                task.wait(0.1)
+            end
+            if watchedCharacter == character then indexing = false end
+        end)
+    end
     local function watchCharacter(character)
         stopWatching()
         watchedCharacter = character
@@ -692,10 +759,11 @@ do
         end))
         table.insert(watchConnections, character.DescendantAdded:Connect(scheduleReconcile))
         scheduleReconcile()
+        indexAvatar(character)
     end
     connect(player.CharacterAdded, watchCharacter)
     connect(player.CharacterAppearanceLoaded, function(character)
-        if character == watchedCharacter then scheduleReconcile() end
+        if character == watchedCharacter then scheduleReconcile(); indexAvatar(character) end
     end)
     connect(shutdown.Event, stopWatching)
     connect(gui.Destroying, stopWatching)
